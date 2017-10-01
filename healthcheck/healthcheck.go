@@ -1,24 +1,39 @@
-package main
+package healthcheck
 
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-redis/redis"
 	"gopkg.in/mgo.v2"
 )
 
-// Statuser if it walks like a Statuser, it is a Healthchecker.
-type Statuser interface {
-	Status() (Status, error)
+// Status represents the service status
+type Status struct {
+	Status  bool
+	Message string
 }
 
-type Healthchecker struct {
+// Healthcheck our class
+type Healthcheck struct {
 	Name string
 }
 
-func (h Healthchecker) timeout(timeout int, fn func()) error {
+// MongoHealthcheck - composes Healthcheck
+type MongoHealthcheck struct {
+	Healthcheck
+}
+
+// RedisHealthcheck - composes Healthcheck
+type RedisHealthcheck struct {
+	Healthcheck
+}
+
+// an instance method
+func (h Healthcheck) timeout(timeout int, fn func()) error {
 	ch := make(chan bool, 1)
 	go func() {
 		fn()
@@ -34,36 +49,36 @@ func (h Healthchecker) timeout(timeout int, fn func()) error {
 	return nil
 }
 
-type MongoHealthchecker struct {
-	Healthchecker
+// NewMongoHealthcheck is the constructor method of MongoHealthcheck
+func NewMongoHealthcheck() MongoHealthcheck {
+	return MongoHealthcheck{Healthcheck{"Mongo"}}
 }
 
-type RedisHealthchecker struct {
-	Healthchecker
+// NewRedisHealthcheck is the constructor method of RedisHealthcheck
+func NewRedisHealthcheck() RedisHealthcheck {
+	return RedisHealthcheck{Healthcheck{"Redis"}}
 }
 
-func NewMongoHealthchecker() MongoHealthchecker {
-	return MongoHealthchecker{Healthchecker{"Mongo"}}
+// Statuser if it walks like a Statuser, it is a Statuser.
+type Statuser interface {
+	Status() (Status, error)
 }
 
-func NewRedisHealthchecker() RedisHealthchecker {
-	return RedisHealthchecker{Healthchecker{"Redis"}}
-}
-
-type Status struct {
-	Status  bool
-	Message string
-}
-
-func (m MongoHealthchecker) Status() (Status, error) {
+// Status - implementing Statuser on MongoHealthcheck
+func (m MongoHealthcheck) Status() (Status, error) {
 	var mongoErr error
 	var session *mgo.Session
 
-	err := m.timeout(2, func() {
-		session, mongoErr = mgo.Dial("mongodb://localhost:27017")
+	mongoHost := os.Getenv("MONGO_HOST")
+	timeout, _ := strconv.Atoi(os.Getenv("MONGO_TIMEOUT"))
+	wait, _ := strconv.Atoi(os.Getenv("WAIT"))
+
+	err := m.timeout(timeout, func() {
+		session, mongoErr = mgo.Dial(mongoHost)
 		if mongoErr != nil {
 			return
 		}
+		time.Sleep(time.Duration(wait) * time.Second)
 		mongoErr = session.Ping()
 	})
 
@@ -79,14 +94,19 @@ func (m MongoHealthchecker) Status() (Status, error) {
 	return Status{true, ""}, nil
 }
 
-func (r RedisHealthchecker) Status() (Status, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+// Status - implementing Statuser
+func (r RedisHealthcheck) Status() (Status, error) {
+	redisHost := os.Getenv("REDIS_HOST")
+
+	client := redis.NewClient(&redis.Options{Addr: redisHost})
 	defer client.Close()
 
+	timeout, _ := strconv.Atoi(os.Getenv("REDIS_TIMEOUT"))
+	wait, _ := strconv.Atoi(os.Getenv("WAIT"))
+
 	var redisErr error
-	err := r.timeout(2, func() {
+	err := r.timeout(timeout, func() {
+		time.Sleep(time.Duration(wait) * time.Second)
 		_, redisErr = client.Ping().Result()
 	})
 
@@ -101,69 +121,86 @@ func (r RedisHealthchecker) Status() (Status, error) {
 	return Status{true, ""}, nil
 }
 
-func runHealthChekers(unhealth chan Status, services []Statuser) {
-	var err error
-	var status Status
-
+// not exported methods - private. healthcheck runner
+func runHealthChekers(services []Statuser) (*Status, error) {
 	for _, service := range services {
-		status, err = service.Status()
-
+		status, err := service.Status()
 		if err != nil {
-			unhealth <- status
-			break
+			return &status, err
 		}
 	}
+	return nil, nil
 }
 
-func runHealthChekersParallel(unhealth chan Status, services []Statuser) {
-	var err error
-	var status Status
-
+// healthcheck runner, in parallel
+func runHealthChekersParallel(unhealth, health chan Status, services []Statuser) {
 	for _, service := range services {
 		go func(service Statuser) {
-			status, err = service.Status()
+			status, err := service.Status()
 			if err != nil {
 				unhealth <- status
+				return
 			}
+			health <- status
 		}(service)
 	}
 }
 
-func healthcheck(w http.ResponseWriter, r *http.Request) {
-	unhealth := make(chan Status, 1)
+func getVitalServices() []Statuser {
+	rHck := NewRedisHealthcheck()
+	mHck := NewMongoHealthcheck()
 
-	rHck := NewRedisHealthchecker()
-	mHck := NewMongoHealthchecker()
-
-	runHealthChekers(unhealth, []Statuser{rHck, mHck})
-
-	select {
-	case status := <-unhealth:
-		fmt.Fprintf(w, status.Message)
-	default:
-		fmt.Fprintf(w, "WORKING")
-	}
+	return []Statuser{rHck, mHck}
 }
 
-func healthcheckParallel(w http.ResponseWriter, r *http.Request) {
-	unhealth := make(chan Status, 1)
-
-	rHck := NewRedisHealthchecker()
-	mHck := NewMongoHealthchecker()
-
-	runHealthChekersParallel(unhealth, []Statuser{rHck, mHck})
-
-	select {
-	case status := <-unhealth:
-		fmt.Fprintf(w, status.Message)
-	default:
-		fmt.Fprintf(w, "WORKING")
-	}
+func duration(fn func()) time.Duration {
+	startTime := time.Now().UTC()
+	fn()
+	duration := time.Since(startTime) / time.Millisecond
+	return duration
 }
 
-func main() {
-	fmt.Println("Listening on port 5555")
-	http.HandleFunc("/healthcheck", healthcheck)
-	http.HandleFunc("/healthcheck-parallel", healthcheckParallel)
-	http.ListenAndServe(":5555", nil)
+// Handler a serial healthcheck
+func Handler(w http.ResponseWriter, r *http.Request) {
+	var status *Status
+	var err error
+
+	services := getVitalServices()
+
+	duration := duration(func() {
+		status, err = runHealthChekers(services)
+	})
+
+	if err == nil {
+		fmt.Fprintf(w, "WORKING %d ms", duration)
+		return
+	}
+
+	fmt.Fprintf(w, "%s %d ms", status.Message, duration)
+}
+
+// ParallelHandler a parallel healthcheck
+func ParallelHandler(w http.ResponseWriter, r *http.Request) {
+	unhealth := make(chan Status, 1)
+	health := make(chan Status)
+	checkSum := 0
+	startTime := time.Now().UTC()
+
+	services := getVitalServices()
+	runHealthChekersParallel(unhealth, health, services)
+
+	for {
+		select {
+		case status := <-unhealth:
+			duration := time.Since(startTime) / time.Millisecond
+			fmt.Fprintf(w, "%s - %d ms", status.Message, duration)
+			return
+		case <-health:
+			if checkSum++; checkSum == len(services) {
+				duration := time.Since(startTime) / time.Millisecond
+				fmt.Fprintf(w, "WORKING %d ms", duration)
+				return
+			}
+		}
+	}
 }

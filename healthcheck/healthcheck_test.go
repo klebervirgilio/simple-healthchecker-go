@@ -1,1 +1,1 @@
-package main
+package healthcheck_test
